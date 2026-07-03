@@ -1,0 +1,24 @@
+# Same as requirements.txt but WITHOUT playwright — Chromium has no build for
+# Android/Termux, and it isn't needed once you have a session via
+# manual_login.py (see MANUAL_SESSION.md).
+#
+#   pip install -r requirements-termux.txt
+#
+httpx>=0.27
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-dotenv>=1.0
+wasmtime>=21.0
+openai
+
+# NOTE on wasmtime: it ships prebuilt wheels for manylinux (glibc) aarch64/x86_64.
+# Termux's Python is built against Android's Bionic libc, not glibc, so the
+# prebuilt wheel may fail to import even if `pip install` reports success.
+# Test it right after installing:
+#   python -c "import wasmtime; print('ok')"
+# If that fails, PoW solving (needed for every chat request) won't work under
+# Termux even with a valid session, and that's a wasmtime/Termux compatibility
+# gap this project can't paper over — building wasmtime from source for Termux,
+# or running the server elsewhere (e.g. a cheap always-on VPS or a Termux:X11 +
+# proot-distro Ubuntu chroot) would be the workarounds.
