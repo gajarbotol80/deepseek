@@ -75,17 +75,17 @@ _client_lock = threading.Lock()
 def get_client() -> DeepSeekClient:
     """Build (once) the shared client and its signed-in session.
 
-    Session resolution: cached file → (if that's missing/stale and
-    SESSION_SYNC_URL is set) pulled from the external backup → headless
-    capture off the persistent profile. If none of that works and
-    SERVER_INTERACTIVE_LOGIN is on (the default), it opens a visible browser
-    window so you can sign in — the triggering request blocks until you
-    finish. If interactive login is off, it raises `LoginRequired`, which the
-    endpoint turns into an actionable 503.
+    Resolution order:
+      1. Local cached session (fresh or stale-but-present)
+      2. Headless refresh from persistent browser profile
+      3. Pull from external SESSION_SYNC_URL (save.php)
+      4. Interactive browser login (only when SERVER_INTERACTIVE_LOGIN is on)
+
+    If nothing works, raises LoginRequired → endpoint returns 503.
 
     This touches Playwright's sync API, so callers must invoke it OFF the event
-    loop (via run_in_threadpool); calling it inside the asyncio loop raises
-    "Playwright Sync API inside the asyncio loop"."""
+    loop (via run_in_threadpool).
+    """
     global _client
     if _client is None:
         with _client_lock:
@@ -97,17 +97,29 @@ def get_client() -> DeepSeekClient:
                     if restored is None:
                         raise
                     restored.save(DEFAULT_SESSION_FILE)
-                    _client = DeepSeekClient(allow_interactive=SERVER_INTERACTIVE_LOGIN)
+                    # Also try to push it back so the local + remote stay in sync
+                    try:
+                        session_sync.push_session(restored)
+                    except Exception:
+                        pass
+                    _client = DeepSeekClient(allow_interactive=False)
     return _client
 
 
-def reset_client() -> None:
-    """Drop the cached client so the next request builds a fresh one — used
-    after /session saves a newly captured session, so it takes effect
-    immediately instead of waiting for a restart."""
+def reset_client(invalidate_local: bool = False) -> None:
+    """Drop the cached client so the next request builds a fresh one.
+
+    Used after /session saves a newly captured session, and also when we
+    detect that DeepSeek has rejected the current session (401/403).
+    If invalidate_local=True, also delete the on-disk session file so we
+    don't keep reloading a known-bad token.
+    """
     global _client
     with _client_lock:
         _client = None
+        if invalidate_local:
+            from deepseek.auth import invalidate_session
+            invalidate_session(DEFAULT_SESSION_FILE)
 
 
 def _error(message: str, status: int = 500, err_type: str = "server_error"):
@@ -119,7 +131,20 @@ def _error(message: str, status: int = 500, err_type: str = "server_error"):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    """Liveness + basic session status (never opens a browser)."""
+    info = {"status": "ok", "session": "none"}
+    try:
+        s = Session.load(DEFAULT_SESSION_FILE)
+        if s and len(s.token) >= 20:
+            info["session"] = "present"
+            info["session_age_seconds"] = round(s.age)
+            info["cookies"] = len(s.cookies)
+        elif session_sync.enabled():
+            # Don't block health on a network call; just note that sync is configured
+            info["session_sync"] = "configured"
+    except Exception:
+        pass
+    return info
 
 
 def _check_admin_token(request: Request) -> Optional[JSONResponse]:
@@ -207,22 +232,28 @@ def session_save(request: Request, payload: dict = Body(...)):
     cookie_header = payload.get("cookies") or ""
     user_agent = payload.get("ua") or payload.get("user_agent") or ""
 
-    if not token:
-        return _error("No `token` in the pasted data — were you signed in to "
-                       "chat.deepseek.com when you ran the bookmarklet?",
-                       status=400, err_type="invalid_request_error")
+    if not token or len(token) < 20:
+        return _error(
+            "No usable `token` in the pasted data — were you signed in to "
+            "chat.deepseek.com when you ran the bookmarklet?",
+            status=400,
+            err_type="invalid_request_error",
+        )
 
     session = Session.from_manual(token, cookie_header, user_agent)
     session.save(DEFAULT_SESSION_FILE)
-    reset_client()
+    reset_client(invalidate_local=False)  # keep the file we just wrote
 
     n_cookies = len(session.cookies)
-    message = f"Session saved ({n_cookies} cookie(s) captured). It's live now — try a chat request."
+    message = (
+        f"Session saved ({n_cookies} cookie(s) captured). "
+        "It's live now — try a chat request."
+    )
 
     if session_sync.enabled():
         try:
             session_sync.push_session(session)
-            message += " Also backed up externally, so it'll survive a cold start."
+            message += " Also backed up externally (with versioned backups on the PHP side)."
         except Exception as e:
             message += f" (Warning: external backup failed — {e})"
 
@@ -266,13 +297,31 @@ async def chat_completions(req: ChatCompletionRequest):
             status=400, err_type="invalid_request_error",
         )
 
+    def _is_auth_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(
+            s in msg
+            for s in (
+                "401",
+                "403",
+                "unauthorized",
+                "forbidden",
+                "token",
+                "login required",
+                "not authenticated",
+                "invalid session",
+            )
+        )
+
+    async def _obtain_client() -> DeepSeekClient:
+        # Off the event loop: get_client() uses Playwright's sync API.
+        return await run_in_threadpool(get_client)
+
     try:
-        # Off the event loop: get_client() uses Playwright's sync API, which
-        # errors if run inside the asyncio loop.
-        client = await run_in_threadpool(get_client)
+        client = await _obtain_client()
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
-    except Exception as e:  # session/login failure
+    except Exception as e:
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
     ref_file_ids: list[str] = []
@@ -285,16 +334,32 @@ async def chat_completions(req: ChatCompletionRequest):
                 await run_in_threadpool(client.wait_for_file, file_id)
                 ref_file_ids.append(file_id)
         except Exception as e:
+            if _is_auth_error(e):
+                # Session died mid-upload — clear it and ask caller to retry
+                reset_client(invalidate_local=True)
+                return _error(
+                    "DeepSeek session expired during image upload. "
+                    "A fresh session will be loaded on the next request "
+                    "(or paste a new one at /session).",
+                    status=503,
+                    err_type="login_required",
+                )
             return _error(f"Image upload failed: {e}", status=502, err_type="upload_error")
 
     if req.stream:
         def gen():
-            stream = client.stream(
-                prompt, conversation_id=req.conversation_id,
-                model=model_type, thinking=req.thinking, search=req.search,
-                ref_file_ids=ref_file_ids,
-            )
-            yield from stream_chunks(req.model, stream)
+            try:
+                stream = client.stream(
+                    prompt, conversation_id=req.conversation_id,
+                    model=model_type, thinking=req.thinking, search=req.search,
+                    ref_file_ids=ref_file_ids,
+                )
+                yield from stream_chunks(req.model, stream)
+            except Exception as e:
+                if _is_auth_error(e):
+                    reset_client(invalidate_local=True)
+                # StreamingResponse has already started; best we can do is stop.
+                raise
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -304,6 +369,34 @@ async def chat_completions(req: ChatCompletionRequest):
             model_type, req.thinking, req.search, ref_file_ids,
         )
     except Exception as e:
+        if _is_auth_error(e):
+            # Drop the bad session so the *next* request pulls a fresh one
+            # from local disk / external sync / interactive login.
+            reset_client(invalidate_local=True)
+            # One automatic recovery attempt: pull remote + retry once
+            try:
+                restored = session_sync.pull_session()
+                if restored is not None:
+                    restored.save(DEFAULT_SESSION_FILE)
+                    reset_client(invalidate_local=False)
+                    client = await _obtain_client()
+                    reply = await run_in_threadpool(
+                        client.chat, prompt, req.conversation_id,
+                        model_type, req.thinking, req.search, ref_file_ids,
+                    )
+                    return completion_response(
+                        req.model, reply.text, prompt, reply.conversation_id,
+                        reasoning=reply.reasoning,
+                    )
+            except Exception:
+                pass
+            return _error(
+                "DeepSeek session expired or was rejected (auth error). "
+                "Local session cleared. Next request will try to restore from "
+                "backup, or paste a fresh session at /session.",
+                status=503,
+                err_type="login_required",
+            )
         return _error(f"DeepSeek request failed: {e}")
 
     return completion_response(req.model, reply.text, prompt, reply.conversation_id,
