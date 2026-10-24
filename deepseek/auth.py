@@ -291,10 +291,10 @@ def get_session(
     """Return a usable session with a resilient resolution order:
 
       1. Fresh cached file (age < max_age)
-      2. Slightly stale cached file still kept as a last-resort candidate
-      3. Headless refresh from the persistent browser profile
-      4. (Server path) External session sync pull — handled by the caller
-         via LoginRequired; see server/api.py get_client()
+      2. Stale-but-present cached file (last local hope)
+      3. Headless refresh from browser profile — ONLY when allow_interactive=True
+         (skipped on Render / headless servers where Chromium is not installed)
+      4. External session sync pull — handled by the caller via LoginRequired
       5. Interactive browser login (only when allow_interactive=True)
 
     If nothing works and interactive login is disallowed, raises LoginRequired.
@@ -308,13 +308,19 @@ def get_session(
     if cached and cached.age < max_age and len(cached.token) >= 20:
         return cached
 
-    # 2) Headless refresh from the (presumably still-signed-in) profile
-    session = _headless_refresh(profile_dir)
-    if session is not None and len(session.token) >= 20:
-        return session
+    # 2) Headless browser refresh — only when interactive is allowed.
+    #    On Render the playwright package may be installed but the Chromium
+    #    binary is missing, so launch raises a hard error. Skip entirely when
+    #    allow_interactive is False (SERVER_INTERACTIVE_LOGIN=0).
+    if allow_interactive and sync_playwright is not None:
+        try:
+            session = _headless_refresh(profile_dir)
+            if session is not None and len(session.token) >= 20:
+                return session
+        except Exception as e:
+            print(f"[auth] headless refresh failed (no browser?): {e}")
 
-    # 3) Stale-but-present cache as last local hope (better than nothing;
-    #    DeepSeek will reject it cleanly with 401 if it's truly dead)
+    # 3) Stale-but-present cache as last local hope
     if cached and len(cached.token) >= 20:
         print(
             f"[auth] using stale cached session (age={cached.age:.0f}s > max_age={max_age}s); "
@@ -323,8 +329,8 @@ def get_session(
         return cached
 
     if not allow_interactive or sync_playwright is None:
-        # Server / Termux path — tell the caller to pull from external sync
-        # or prompt the user for a manual paste.
+        # Server / Termux / Render path — caller should pull from SESSION_SYNC
+        # or ask the user to paste a session at /session.
         raise LoginRequired()
 
     print("[auth] No valid session found — opening a browser window to log in...")
