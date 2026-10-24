@@ -270,40 +270,63 @@ def _headless_refresh(profile_dir: Path) -> Optional[Session]:
     return session
 
 
+def invalidate_session(session_file: Path = DEFAULT_SESSION_FILE) -> None:
+    """Remove the local session file so the next get_session() will re-resolve
+    (headless refresh / external sync / interactive login). Safe to call even
+    if the file does not exist."""
+    try:
+        if session_file.exists():
+            session_file.unlink()
+            print(f"[auth] invalidated local session file: {session_file}")
+    except Exception as e:
+        print(f"[auth] could not remove session file {session_file}: {e}")
+
+
 def get_session(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     session_file: Path = DEFAULT_SESSION_FILE,
     max_age: int = SESSION_MAX_AGE,
     allow_interactive: bool = True,
 ) -> Session:
-    """Return a usable session: cached file if fresh, else a headless refresh
-    from the browser profile.
+    """Return a usable session with a resilient resolution order:
 
-    If neither works and `allow_interactive` is True, open a visible window for
-    manual sign-in. If it's False (the server's case — we can't pop a browser
-    mid-request), raise `LoginRequired` telling the user to run the login step.
+      1. Fresh cached file (age < max_age)
+      2. Slightly stale cached file still kept as a last-resort candidate
+      3. Headless refresh from the persistent browser profile
+      4. (Server path) External session sync pull — handled by the caller
+         via LoginRequired; see server/api.py get_client()
+      5. Interactive browser login (only when allow_interactive=True)
+
+    If nothing works and interactive login is disallowed, raises LoginRequired.
 
     Note: this uses Playwright's *sync* API, so it must not be called from inside
-    an asyncio event loop — call it from a worker thread (e.g. run_in_threadpool)."""
+    an asyncio event loop — call it from a worker thread (e.g. run_in_threadpool).
+    """
     cached = Session.load(session_file)
-    if cached and cached.age < max_age:
+
+    # 1) Fresh cache — use immediately
+    if cached and cached.age < max_age and len(cached.token) >= 20:
         return cached
 
-    # Try a headless refresh from the (presumably logged-in) persistent profile.
+    # 2) Headless refresh from the (presumably still-signed-in) profile
     session = _headless_refresh(profile_dir)
-    if session is not None:
+    if session is not None and len(session.token) >= 20:
         return session
 
+    # 3) Stale-but-present cache as last local hope (better than nothing;
+    #    DeepSeek will reject it cleanly with 401 if it's truly dead)
+    if cached and len(cached.token) >= 20:
+        print(
+            f"[auth] using stale cached session (age={cached.age:.0f}s > max_age={max_age}s); "
+            "will fail fast if DeepSeek rejects it"
+        )
+        return cached
+
     if not allow_interactive or sync_playwright is None:
-        # Either the caller can't pop a browser mid-request (server case), or
-        # there's no browser available on this platform at all (Termux/Android).
-        # Either way, tell the caller how to fix it instead of crashing.
+        # Server / Termux path — tell the caller to pull from external sync
+        # or prompt the user for a manual paste.
         raise LoginRequired()
 
-    # Not logged in yet — open a visible window so the user can sign in (and
-    # clear the human-check) by hand. The persistent profile means this only
-    # happens once — later calls capture the token headlessly. We just confirmed
-    # (above) there's no token, so go straight to the sign-in page.
     print("[auth] No valid session found — opening a browser window to log in...")
     return login(profile_dir=profile_dir, assume_logged_out=True)
 
